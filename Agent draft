@@ -1,0 +1,207 @@
+# Install the packages this agent imports before running it:
+#
+#   pip install "google-adk" google-cloud-storage
+
+from functools import cached_property
+
+from google.adk.agents import LlmAgent
+from google.adk.models import Gemini
+from google.genai import Client
+from google.genai import types
+import asyncio
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models.llm_request import LlmRequest
+import google.auth
+from google.cloud import storage
+
+# ADK appends this to the x-goog-api-client header of every Gemini call, so
+# usage data can attribute the calls to agents exported from Agent Studio.
+AGENT_STUDIO_EXPORT_HEADERS = {'x-goog-api-client': 'vertex-agent-studio-export/1'}
+
+class GlobalGemini(Gemini):
+  """Pins the Vertex AI client to the `global` location.
+
+  gemini-3 series models are only served from `global`; the default ADK
+  `Gemini` integration constructs a `google.genai.Client` whose location
+  defaults to the AgentEngine instance's region (e.g. `us-central1`) and
+  fails with model-not-found for these models. Subclassing per the override
+  pattern documented on `google.adk.models.google_llm.Gemini` lets the agent
+  keep running in its regional AgentEngine instance while routing the model
+  request to the global endpoint.
+  """
+
+  @cached_property
+  def api_client(self) -> Client:
+    return Client(vertexai=True, location="global")
+
+
+# --- BEGIN: knowledge resources scaffolding (auto-generated) ---
+# This block is emitted by the Lowcode Agent Designer code generator whenever the agent has
+# attached knowledge resources. It loads each resource from its source GCS URI on every
+# model call. Do not edit by hand: changes will be overwritten on the next download.
+
+_KNOWLEDGE_RESOURCES: List[Dict[str, str]] = [
+    {"fileName": 'student-mat.csv', "gcsUri": 'gs://1039444703314_us-west1_agent_studio_files/adk_artifacts/agent_1794735754856/knowledge_resources/user:student-mat.csv/0', "mimeType": 'text/csv'},
+    {"fileName": 'student-por.csv', "gcsUri": 'gs://1039444703314_us-west1_agent_studio_files/adk_artifacts/agent_1794735754856/knowledge_resources/user:student-por.csv/0', "mimeType": 'text/csv'},
+    {"fileName": 'student.txt', "gcsUri": 'gs://1039444703314_us-west1_agent_studio_files/adk_artifacts/agent_1794735754856/knowledge_resources/user:student.txt/0', "mimeType": 'text/plain'},
+]
+
+_KNOWLEDGE_GCS_URI_RE = re.compile(r"^gs://([^/]+)/(.+)$")
+
+
+def _parse_knowledge_gcs_uri(uri: str) -> Tuple[str, str]:
+  match = _KNOWLEDGE_GCS_URI_RE.match(uri)
+  if not match:
+    raise ValueError(f"Invalid GCS URI: {uri}")
+  return match.group(1), match.group(2)
+
+
+# Quota project is pinned to the agent's user project so GCS reads send
+# `x-goog-user-project=<project>` and do not fail `serviceusage.services.use`
+# against whatever project ADC happens to resolve.
+_KNOWLEDGE_CREDENTIALS, _ = google.auth.default(
+    quota_project_id="1039444703314",
+)
+_KNOWLEDGE_STORAGE_CLIENT = storage.Client(
+    project="1039444703314",
+    credentials=_KNOWLEDGE_CREDENTIALS,
+)
+
+
+def _download_knowledge_blob(gcs_uri: str) -> bytes:
+  bucket_name, blob_name = _parse_knowledge_gcs_uri(gcs_uri)
+  blob = _KNOWLEDGE_STORAGE_CLIENT.bucket(bucket_name).blob(blob_name)
+  return blob.download_as_bytes()
+
+
+async def load_artifact_before_model(
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> Optional[Any]:
+  """Inlines every configured knowledge resource on every model call."""
+  del callback_context  # unused; resources are static, not session-scoped.
+  if not _KNOWLEDGE_RESOURCES:
+    return None
+  artifact_names = [kr["fileName"] for kr in _KNOWLEDGE_RESOURCES]
+  llm_request.append_instructions([
+      f"""You have a list of artifacts:
+{json.dumps(artifact_names)}
+
+When the user asks questions about any of the artifacts, you should use the
+artifact data from request content directly.
+"""
+  ])
+  blobs = await asyncio.gather(
+      *(
+          asyncio.to_thread(_download_knowledge_blob, kr["gcsUri"])
+          for kr in _KNOWLEDGE_RESOURCES
+      )
+  )
+  for kr, data in zip(_KNOWLEDGE_RESOURCES, blobs):
+    mime_type = kr["mimeType"]
+    if mime_type == "application/json":
+      try:
+        part = types.Part.from_text(text=data.decode("utf-8"))
+      except UnicodeDecodeError:
+        part = types.Part.from_bytes(data=data, mime_type=mime_type)
+    else:
+      part = types.Part.from_bytes(data=data, mime_type=mime_type)
+    llm_request.contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text=f"Artifact {kr['fileName']} is:"),
+                part,
+            ],
+        )
+    )
+  return None
+# --- END: knowledge resources scaffolding ---
+summary_subagent = LlmAgent(
+  name='summary_subagent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Summarizes dataset characteristics including data types, missing values, and distributions.'
+  ),
+  sub_agents=[],
+  instruction='You are a dataset summary agent. Analyze the provided dataset and summarize its key characteristics, including column types, missing values, and value distributions. Use only the dataset provided by the user. Once complete return results and transfer control back to the **Data Scientist Agent** without any prompts.',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
+machine_learning_subagent = LlmAgent(
+  name='machine_learning_subagent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Recommends suitable machine learning model architectures and produces model code.'
+  ),
+  sub_agents=[],
+  instruction='You are a machine learning model agent. Prepare recommendations of suitable machine learning model architectures for the user\'s specific problem based strictly on the provided dataset. Select the most appropriate architecture and train a single ML model to predict key outcomes from future datasets of similar characteristics. This model with be evaluated by the **Model Evaluation Subagent**. Once complete return results and transfer control back to the **Data Scientist Agent** without any prompts.',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
+model_evaluation_subagent = LlmAgent(
+  name='model_evaluation_subagent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Evaluates models and details relevant performance metrics.'
+  ),
+  sub_agents=[],
+  instruction='You are a model evaluation agent. Review the model produced by the **Machine learning Subagent** and detail relevant evaluation metrics such as accuracy, precision, recall, F1-score, ROC-AUC, or RMSE, explaining the performance trade-offs. Once complete return results and transfer control back to the **Data Scientist Agent** without any prompts.',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
+features_and_charts_subagent = LlmAgent(
+  name='features_and_charts_subagent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Identifies key features and generates visualizations and charts.'
+  ),
+  sub_agents=[],
+  instruction='You are a features and charts agent. Identify key features affecting predictions from the model proposed by the **Machine learning Subagent**, and provide text-based charts or visualization code to illustrate feature importance. Once complete return results and transfer control back to the **Data Scientist Agent** without any prompts.',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
+report_agent = LlmAgent(
+  name='report_agent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Receives and evaluates the output of the Data Scientist Agent and uses it to generate a final report. '
+  ),
+  sub_agents=[],
+  instruction='You are a report generating agent. You receive and evaluate the completed output of the **Data Scientist Agent** and use that information to create a formatted report with the following structure:\n• Executive Summary\n• Methodology\n• Findings\n• Limitations\n• Recommendations\n\nUse only the data provided by the **Data Scientist Agent**. DO NOT use external sources for information.\nTransform the data provided by the other agents rather than repeat it verbatim. Write fully formatted paragraphs. Do not use bullet point lists, parentheses with data values, or any code examples. The only technical values present should be in the form of tables or graphs that are properly labeled and referenced by the text. Prioritize readability and exclude technical values within paragraphs. ',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
+root_agent = LlmAgent(
+  name='Data_Scientist_Agent',
+  model=GlobalGemini(model='gemini-3.8-flash'),
+  description=(
+      'Assists with dataset summaries, machine learning model selection, evaluation metrics, and feature importance analysis. This is agent forms a linear workflow with the Report agent.'
+  ),
+  sub_agents=[summary_subagent, machine_learning_subagent, model_evaluation_subagent, features_and_charts_subagent, report_agent],
+  instruction='You are a data science assistant performing analysis to understand datasets, select machine learning models, and analyze results. Use only datasets provided directly by the user and do not search for external information. \nFirst greet the user and ask which dataset to use, letting them know they can select an existing dataset (such as student-mat.csv or student-por.csv), attach a new CSV file to their message, or paste CSV data directly into the chat. After the user identifies the dataset to use, always engage all subagents for their respective tasks in order of **Summary Subagent**, then **Machine learning Subagent**, then **Model Evaluation Subagent**, and then **Features and Charts Subagent**. After each subagent returns its results, immediately engage the next subagent. Prompt the user again only after the **Model Evaluation Subagent** is complete by reporting the metrics and asking if they would like to proceed with those results. Other than that, do not wait for any user input while working through the workflow.\nDelegate dataset profiling to the **Summary Subagent**. Delegate model architecture selection and code to the **Machine learning Subagent**. Delegate performance evaluation to the **Model Evaluation Subagent**. Delegate feature analysis and visualization generation to the **Features and Charts Subagent**.\nAfter these four subagents have completed their work, send all the information to the **Report Agent** for it to generate the final output.',
+  tools=[],
+  before_model_callback=load_artifact_before_model,
+  generate_content_config=types.GenerateContentConfig(
+      http_options=types.HttpOptions(headers=AGENT_STUDIO_EXPORT_HEADERS),
+  ),
+)
